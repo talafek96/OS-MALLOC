@@ -46,9 +46,11 @@ private:
 
     inline _MallocMetaData* getMetaData(void* p)
     {
-        return reinterpret_cast<_MallocMetaData*>(p - _METADATA_SIZE);
+        return reinterpret_cast<_MallocMetaData*>(reinterpret_cast<char*>(p) - _METADATA_SIZE);
     }
 
+    // Set the metadata members. 
+    // NOTICE: The size variable SHOULD NOT include the metadata size.
     void setMetaData(_MallocMetaData* metadata, size_t size, bool is_free, _MallocMetaData* next, _MallocMetaData* prev)
     {
         if(!metadata)
@@ -64,7 +66,7 @@ private:
     // Calculate the payload address by the metadata address.
     inline void* getPayload(_MallocMetaData* metadata)
     {
-        return metadata + _METADATA_SIZE;
+        return reinterpret_cast<void*>(reinterpret_cast<char*>(metadata) + _METADATA_SIZE);
     }
 
     // Return the next malloc metadata that marks a free payload starting from start.
@@ -76,14 +78,14 @@ private:
         {
             return nullptr;
         }
-        if(start->is_free)
+        if(start->is_free && start->size >= bytes)
         {
             return start;
         }
         while(start->next)
         {
             start = start->next;
-            if(start->is_free && start->size - _METADATA_SIZE >= bytes)
+            if(start->is_free && start->size >= bytes)
             {
                 return start;
             }
@@ -134,7 +136,7 @@ public:
             }
 
             head = reinterpret_cast<_MallocMetaData*>(prev_brk);
-            setMetaData(head, size + _METADATA_SIZE, false, nullptr, nullptr);
+            setMetaData(head, size, false, nullptr, nullptr);
             
             num_allocated_blocks++;
             num_allocated_bytes += size;
@@ -153,7 +155,7 @@ public:
             _MallocMetaData* tail = getTail();
             tail->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
 
-            setMetaData(reinterpret_cast<_MallocMetaData*>(prev_brk), size + _METADATA_SIZE, false, nullptr, tail);
+            setMetaData(reinterpret_cast<_MallocMetaData*>(prev_brk), size, false, nullptr, tail);
             num_allocated_blocks++;
             num_allocated_bytes += size;
             num_meta_data_bytes += _METADATA_SIZE;
@@ -180,7 +182,7 @@ public:
 
     void sfree(void* p)
     {
-        _MallocMetaData* ptr = reinterpret_cast<_MallocMetaData*>(getMetaData(p));
+        _MallocMetaData* ptr = getMetaData(p);
         if(p == nullptr || ptr->is_free == true)
         {
             return;
@@ -197,8 +199,13 @@ public:
             return NULL;
         }
 
+        if(oldp == NULL)
+        {
+            return smalloc(size);
+        }
+
         _MallocMetaData* oldmeta = reinterpret_cast<_MallocMetaData*>(getMetaData(oldp)); 
-        if(oldmeta->size - _METADATA_SIZE >= size)
+        if(oldmeta->size >= size)
         {
             return oldp;
         }
@@ -215,13 +222,13 @@ public:
             _MallocMetaData* tail = getTail();
             tail->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
 
-            setMetaData(reinterpret_cast<_MallocMetaData*>(prev_brk), size + _METADATA_SIZE, false, nullptr, tail);
+            setMetaData(reinterpret_cast<_MallocMetaData*>(prev_brk), size, false, nullptr, tail);
             num_allocated_blocks++;
             num_allocated_bytes += size;
             num_meta_data_bytes += _METADATA_SIZE;
 
             // Copy the old payload:
-            memcpy(getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk)), oldp, oldmeta->size - _METADATA_SIZE);
+            memcpy(getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk)), oldp, oldmeta->size);
             
             sfree(oldp); // This will free and update the stats.
             return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
