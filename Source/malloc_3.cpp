@@ -551,7 +551,7 @@ public:
         {
             return nullptr;
         }
-        memset(p, 0, num * size);
+        if(!IS_MMAPPED(size)) memset(p, 0, num * size);
         return p;
     }
 
