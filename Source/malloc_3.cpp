@@ -1,6 +1,8 @@
 #include <unistd.h>
 #include <cstring>
 #include <cassert>
+#include <sys/mman.h>
+
 #define _METADATA_SIZE sizeof(_MallocMetaData)
 #define _LIST_RANGE 1024 // = 1KB
 #define _MAX_ALLOC 131071 // = 128KB, the maximum allocatable size on the heap with sbrk().
@@ -9,7 +11,7 @@
 
 #define MAX_ALLOC_SIZE 100000000
 #define SIZE_TO_INDEX(size) (size/_LIST_RANGE)
-#define IS_MMAPPED(metadata) (metadata->size > _MAX_ALLOC)
+#define IS_MMAPPED(size) (size > _MAX_ALLOC)
 
 // The metadata struct of each allocated block
 struct _MallocMetaData
@@ -235,7 +237,7 @@ private:
     // ********** Mmap List Methods ********** //
     void mmapInsert(_MallocMetaData* to_insert)
     {
-        if (!to_insert || !IS_MMAPPED(to_insert))
+        if (!to_insert || !IS_MMAPPED(to_insert->size))
         {
             return;
         }
@@ -283,7 +285,7 @@ private:
     // ********** General Purpose ********** //
     /**
      * Check if the block uses a lot less data than the total payload size and:
-     * If it is, split it and return the address of the splitted free metadata struct.
+     * If it is, split it, add the new free block to the hist, and return the address of the splitted FREE metadata struct.
      * Otherwise return NULL.
      */ 
     _MallocMetaData* split(_MallocMetaData* block, size_t in_use)
@@ -425,47 +427,121 @@ public:
             return NULL;
         }
 
-        if(head == nullptr) // This is the first allocation made so far
+        if(!IS_MMAPPED(size))
         {
-            void* prev_brk = sbrk(size + _METADATA_SIZE);
-            if(prev_brk == (void*)-1)
+            if(head == nullptr) // This is the first allocation made so far
             {
-                return NULL;
+                void* prev_brk = sbrk(size + _METADATA_SIZE);
+                if(prev_brk == (void*)-1)
+                {
+                    return NULL;
+                }
+
+                head = reinterpret_cast<_MallocMetaData*>(prev_brk);
+                setMetaData(head, size, false, nullptr, nullptr);
+                wilderness = head;
+
+                // Update statistics:
+                num_allocated_blocks++;
+                num_allocated_bytes += size;
+                num_meta_data_bytes += _METADATA_SIZE;
+
+                return getPayload(head);
             }
 
-            head = reinterpret_cast<_MallocMetaData*>(prev_brk);
-            setMetaData(head, size, false, nullptr, nullptr);
-            wilderness = head;
+            // Otherwise, this wasn't the first allocation, so we try to find a free block.
+            _MallocMetaData* free_block = getFreeBlock(size);
+            if(free_block == nullptr) // If there is no free block that can contain size bytes
+            {
+                if(wilderness->is_free) // If the last block in the heap is free we can simply enlarge it:
+                {
+                    size_t wilderness_prev_size = wilderness->size;
+                    if(size > wilderness->size) // Check if needed to enlarge or can contain.
+                    {
+                        // Need to extend. (Should always enter this if case because free_block == nullptr)
+                        intptr_t to_extend = size - wilderness_prev_size;
+                        void* prev_brk = sbrk(to_extend);
+                        if(prev_brk == (void*)-1)
+                        {
+                            return NULL;
+                        }
+                    }
+                    histRemove(wilderness);
+                    setMetaData(wilderness, size, false, nullptr, wilderness->prev);
+                    _MallocMetaData* res = split(wilderness, size);
+                    
+                    if(res) // If split was successful: (Should never happen theoretically)
+                    {
+                        // Update statistics:
+                        num_free_bytes -= (wilderness->size + _METADATA_SIZE);
+                        num_meta_data_bytes += _METADATA_SIZE;
+                        return getPayload(wilderness);
+                    }
+
+                    // No split was needed:
+                    // Update statistics:
+                    num_free_blocks--;
+                    num_free_bytes -= wilderness_prev_size; // The total size was not counted before in the statistic
+                    return getPayload(wilderness);
+                }
+
+                void* prev_brk = sbrk(size + _METADATA_SIZE); // Allocate space at the top of the heap
+                if(prev_brk == (void*)-1)
+                {
+                    return NULL;
+                }
+
+                // Update the new wilderness block:
+                _MallocMetaData* last_wilderness = wilderness;
+                last_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk);
+                wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
+
+                setMetaData(wilderness, size, false, nullptr, last_wilderness);
+
+                // Update statistics:
+                num_allocated_blocks++;
+                num_allocated_bytes += size;
+                num_meta_data_bytes += _METADATA_SIZE;
+                
+                return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
+            }
+
+            // If there exists a free block that can contain size bytes:
+            free_block->is_free = false;
+            _MallocMetaData* res = split(free_block, size);
+
+            // Update statistics:
+            if(!res)
+            {
+                // If split failed, then we have one less free block.
+                num_free_blocks--;
+                num_free_bytes -= free_block->size;
+            }
+            else
+            {
+                // If split was successful, we need to count _METADATA_SIZE less bytes in the total free bytes statistic.
+                num_free_bytes -= (wilderness->size + _METADATA_SIZE);
+                num_meta_data_bytes += _METADATA_SIZE;
+            }
+            
+            return getPayload(free_block);
+        }
+        else
+        {   // TODO: Check why exactly use these flags.
+            void* ptr = mmap(NULL, size + _METADATA_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if(ptr == MAP_FAILED)
+            {
+                return nullptr;
+            }
+            setMetaData(reinterpret_cast<_MallocMetaData*>(ptr), size, false, nullptr, nullptr);
+            mmapInsert(reinterpret_cast<_MallocMetaData*>(ptr));
+
+            // Update statistics:
             num_allocated_blocks++;
             num_allocated_bytes += size;
             num_meta_data_bytes += _METADATA_SIZE;
-            return getPayload(head);
+            return getPayload(reinterpret_cast<_MallocMetaData*>(ptr));
         }
-
-        _MallocMetaData* free_block = getNextFree(head, size);
-        if(free_block == nullptr) // If there is no free block that can contain size bytes
-        {
-            void* prev_brk = sbrk(size + _METADATA_SIZE); // Allocate space at the top of the heap
-            if(prev_brk == (void*)-1)
-            {
-                return NULL;
-            }
-            _MallocMetaData* last_wilderness = wilderness;
-            last_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
-            wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
-
-            setMetaData(wilderness, size, false, nullptr, last_wilderness);
-            num_allocated_blocks++;
-            num_allocated_bytes += size;
-            num_meta_data_bytes += _METADATA_SIZE;
-            return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
-        }
-
-        // If there exists a free block that can contain size bytes:
-        free_block->is_free = false;
-        num_free_blocks--;
-        num_free_bytes -= free_block->size;
-        return getPayload(free_block);
     }
     
     void* scalloc(size_t num, size_t size)
