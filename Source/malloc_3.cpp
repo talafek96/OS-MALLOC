@@ -289,7 +289,7 @@ private:
      * surrounding it, and merge if possible.
      * Return true if was able to merge and update new_block to point to the new metadata.
      * Otherwise, return false.
-     * If new_block is null, only return if the merge is possible in any way.
+     * If new_block is null, only return true if the merge is possible in any way or false otherwise.
      */ 
     bool mergeFree(_MallocMetaData* block, _MallocMetaData** new_block)
     {
