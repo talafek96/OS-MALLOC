@@ -1,10 +1,11 @@
 #include <unistd.h>
 #include <cstring>
-
+#include <cassert>
 #define _METADATA_SIZE sizeof(_MallocMetaData)
 #define _LIST_RANGE 1024 // = 1KB
 #define _MAX_ALLOC 131071 // = 128KB, the maximum allocatable size on the heap with sbrk().
 #define _HIST_SIZE ((_MAX_ALLOC+1)/_LIST_RANGE) // = 128KB/1KB = 128
+#define _MIN_SPLIT _HIST_SIZE
 
 #define MAX_ALLOC_SIZE 100000000
 #define SIZE_TO_INDEX(size) (size/_LIST_RANGE)
@@ -127,26 +128,133 @@ private:
     }
 
     // ********** Historgram Methods ********** //
-    void histInsert(_MallocMetaData* to_insert) // TODO: histInsert
+    void histInsert(_MallocMetaData* to_insert)
     {
-        // Do magic.
+        int size = to_insert->size;
+        int index = SIZE_TO_INDEX(size);
+        assert(index < _HIST_SIZE);
+
+        if (hist[index].head == nullptr) // The list is empty at the corresponding index for size
+        {
+            assert(hist[index].tail == nullptr);
+            hist[index].head = to_insert;
+            hist[index].tail = to_insert;
+            return;
+        }
+
+        _MallocMetaData* node = hist[index].head;
+        while(node)
+        {
+            if(to_insert->size <= node->size)
+            {
+                if (node == hist[index].head) // The new node should be inserted before the current head
+                {
+                    to_insert->next_hist = hist[index].head;
+                    hist[index].head->prev_hist = to_insert;
+                    hist[index].head = to_insert;
+                    to_insert->prev_hist = nullptr;
+                    return;
+                }
+                // it should be inserted somewhere in the middle, before the current node (not head and not tail)
+                node->prev_hist->next_hist = to_insert;
+                to_insert->next_hist = node;
+                to_insert->prev_hist = node->prev_hist;
+                node->prev_hist = to_insert;
+                return;
+            }
+            node = node->next_hist;
+        }
+
+        // The new node should be last in the list
+        hist[index].tail->next_hist = to_insert;
+        to_insert->prev_hist = hist[index].tail;
+        to_insert->next_hist = nullptr;
+        hist[index].tail = to_insert;
+        return;
     }
 
-    void histRemove(_MallocMetaData* to_remove) // TODO: histRemove
+    void histRemove(_MallocMetaData* to_remove)
     {
-        // Do some more magic.
+        if (!to_remove)
+        {
+            return;
+        }
+        int size = to_remove->size;
+        int index = SIZE_TO_INDEX(size);
+        assert(index < _HIST_SIZE);
+
+        if(to_remove == hist[index].head && to_remove == hist[index].tail)
+        {
+            // This is the only member in the list. Remove it.
+            hist[index].head = nullptr;
+            hist[index].tail = nullptr;
+            return;
+        }
+        else if(to_remove == hist[index].head)
+        {
+            // This is not the only member in the list, but it is the first. Remove it.
+            hist[index].head->next_hist->prev_hist = nullptr;
+            hist[index].head = hist[index].head->next_hist;
+            return;
+        }
+        else if (to_remove == hist[index].tail)
+        {
+            hist[index].tail->prev_hist->next_hist = nullptr;
+            hist[index].tail = hist[index].tail->prev_hist;
+            return;
+        }
+
+        // This is not the only member in the list, but it is nor the first or the last. Remove it.
+        to_remove->prev_hist->next_hist = to_remove->next_hist;
+        to_remove->next_hist->prev_hist = to_remove->prev_hist;
+        return;
     }
     // $$$$$$$$$$ Historgram Functions $$$$$$$$$$ //
 
     // ********** Mmap List Methods ********** //
-    void mmapInsert(_MallocMetaData* to_insert) // TODO: mmapInsert
+    void mmapInsert(_MallocMetaData* to_insert)
     {
-        // You're a wizard harry!
+        if (!to_insert || !IS_MMAPPED(to_insert))
+        {
+            return;
+        }
+        if(mmap_head == nullptr) // This is the first mmapped region, add it.
+        {
+            mmap_head = to_insert;
+            to_insert->next = nullptr;
+            to_insert->prev = nullptr;
+            return;
+        }
+        // otherwise, we will insert it in the head of the list.
+        to_insert->next = mmap_head;
+        to_insert->prev = nullptr;
+        mmap_head->prev = to_insert;
+        mmap_head = to_insert;
+        return;
     }
 
-    void mmapRemove(_MallocMetaData* to_remove) // TODO: mmapRemove
+    void mmapRemove(_MallocMetaData* to_remove)
     {
-        // Its 'Windgardium Leviosa', not LevioSAAAR!
+        if(to_remove == mmap_head && to_remove->next == nullptr)
+        {
+            // This is both the first and last member of the list.
+            mmap_head = nullptr; // Empty the list.
+            return;
+        }
+        else if (to_remove == mmap_head)
+        {
+            // This is the first but not last member of the list.
+            to_remove->next->prev = nullptr;
+            mmap_head = to_remove->next;
+            return;
+        }
+        // This is not the first member of the list.
+        to_remove->prev->next = to_remove->next;
+        if(to_remove->next != nullptr) // It's not the last member of the list.
+        {
+            to_remove->next->prev = to_remove->prev;
+        }
+        return;
     }
     // $$$$$$$$$$ Mmap List Methods $$$$$$$$$$ //
 
@@ -157,9 +265,23 @@ private:
      * If it is, split it and return the address of the splitted free metadata struct.
      * Otherwise return NULL.
      */ 
-    _MallocMetaData* split(_MallocMetaData* block, size_t in_use) // TODO: split
+    _MallocMetaData* split(_MallocMetaData* block, size_t in_use)
     {
-        // Black magic.
+        // Check if the leftover size is big enough for a new block of at least _MIN_SPLIT bytes + metadata size bytes:
+        if (block->size - in_use >= _MIN_SPLIT + _METADATA_SIZE) 
+        {
+            block->size = in_use;
+            void* split_point = reinterpret_cast<void*>(reinterpret_cast<char*>(block) + in_use); //FIXME i hate pointer arithmentics
+            setMetaData(reinterpret_cast<_MallocMetaData*>(split_point), block->size-in_use, true, block->next, block);
+            block->next = reinterpret_cast<_MallocMetaData*>(split_point);
+
+            // Insert the new freed block to the hist:
+            histInsert(reinterpret_cast<_MallocMetaData*>(split_point));
+            return reinterpret_cast<_MallocMetaData*>(split_point);
+        }
+
+        // Split was not necessary:
+        return nullptr;
     }
 
     /**
@@ -170,7 +292,7 @@ private:
      */ 
     bool mergeFree(_MallocMetaData* block, _MallocMetaData** new_block) // TODO: mergeFree
     {
-        // Dragons be here.
+        //
     }
     // $$$$$$$$$$ General Purpose $$$$$$$$$$ //
 
@@ -284,10 +406,11 @@ public:
             {
                 return NULL;
             }
-            _MallocMetaData* tail = getWilderness();
-            tail->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
+            _MallocMetaData* old_wilderness = wilderness;
+            old_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
+            wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
 
-            setMetaData(reinterpret_cast<_MallocMetaData*>(prev_brk), size, false, nullptr, tail);
+            setMetaData(wilderness, size, false, nullptr, old_wilderness);
             num_allocated_blocks++;
             num_allocated_bytes += size;
             num_meta_data_bytes += _METADATA_SIZE;
