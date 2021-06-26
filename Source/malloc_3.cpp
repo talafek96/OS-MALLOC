@@ -50,7 +50,7 @@ private:
     head(nullptr), wilderness(nullptr), num_free_blocks(0), num_free_bytes(0), num_allocated_blocks(0),
     num_allocated_bytes(0), num_meta_data_bytes(0), size_meta_data(_METADATA_SIZE) { }
 
-    _AllocList(_AllocList& other) = delete; // disable copy ctor 
+    _AllocList(_AllocList& other) = delete; // disable copy ctor
     void operator=(_AllocList const &) = delete; // disable = operator
 
     // Create a metadata struct.
@@ -289,10 +289,98 @@ private:
      * surrounding it, and merge if possible.
      * Return true if was able to merge and update new_block to point to the new metadata.
      * Otherwise, return false.
+     * If new_block is null, only return if the merge is possible in any way.
      */ 
-    bool mergeFree(_MallocMetaData* block, _MallocMetaData** new_block) // TODO: mergeFree
+    bool mergeFree(_MallocMetaData* block, _MallocMetaData** new_block)
     {
-        //
+        if(!block || !block->is_free)
+        {
+            return false;
+        }
+        if(block->prev)
+        {
+            if(block->prev->is_free)
+            {
+                if(block->next)
+                {
+                    if(block->next->is_free)
+                    {
+                        if(new_block) _mergeFreeToSurrounding(block, new_block);
+                        return true;
+                    }
+                    else
+                    {
+                        if(new_block) _mergeFreeToPrev(block, new_block);
+                        return true;
+                    }
+                }
+                if(new_block) _mergeFreeToPrev(block, new_block);
+                return true;
+            }
+        }
+        else if(block->next)
+        {
+            if(block->next->is_free)
+            {
+                if(new_block) _mergeFreeToNext(block, new_block);
+                return true;
+            }
+        }
+
+        // If we get here, no merge was successful.
+        return false;
+    }
+
+    /**
+     * Assumption: block, its prev, and its next - all exist and are free.
+     * Merge all of them to one big block and set new_block to the metadata address of the merged block.
+     */
+    _MallocMetaData* _mergeFreeToSurrounding(_MallocMetaData* block, _MallocMetaData** new_block)
+    {
+        assert(block); assert(block->next); assert(block->prev); assert(new_block);
+        return _mergeFreeToNext(_mergeFreeToPrev(block, new_block), new_block);
+    }
+
+    /**
+     * Assumption: block and its prev exist and are free.
+     * Merge them to one big block and set new_block to the metadata address of the merged block.
+     */
+    _MallocMetaData* _mergeFreeToPrev(_MallocMetaData* block, _MallocMetaData** new_block)
+    {
+        assert(block); assert(block->prev); assert(new_block);
+        histRemove(block);
+        histRemove(block->prev);
+
+        setMetaData(block->prev, block->prev->size + block->size + _METADATA_SIZE, true, block->next, block->prev->prev);
+        if(block->prev->next) // NOTE: This is the updated next block for the merged block - if it exists:
+        {
+            block->prev->next->prev = block->prev;
+        }
+
+        histInsert(block->prev);
+        *new_block = block->prev;
+        return block->prev;
+    }
+
+    /**
+     * Assumption: block and its next exist and are free.
+     * Merge them to one big block and set new_block to the metadata address of the merged block.
+     */
+    _MallocMetaData* _mergeFreeToNext(_MallocMetaData* block, _MallocMetaData** new_block)
+    {
+        assert(block); assert(block->next); assert(new_block);
+        histRemove(block);
+        histRemove(block->next);
+
+        setMetaData(block, block->size + block->next->size + _METADATA_SIZE, true, block->next->next, block->prev);
+        if(block->next) // NOTE: This is the updated next block - if it exists:
+        {
+            block->next->prev = block;
+        }
+
+        histInsert(block);
+        *new_block = block;
+        return block;
     }
     // $$$$$$$$$$ General Purpose $$$$$$$$$$ //
 
