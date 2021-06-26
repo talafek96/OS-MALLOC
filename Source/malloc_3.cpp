@@ -91,27 +91,44 @@ private:
         return reinterpret_cast<void*>(reinterpret_cast<char*>(metadata) + _METADATA_SIZE);
     }
 
-    // Return the next malloc metadata that marks a free payload starting from start.
-    // * Bytes will be the size of the payload without the metadata size.
-    // If none exist, or start is nullptr - return nullptr.
-    _MallocMetaData* getNextFree(_MallocMetaData* start, size_t bytes)
+    // Return a malloc metadata that marks a free payload.
+    // - Argument 'bytes' will be the size of the requested new payload without the metadata size.
+    // - The search will be prioritized by size - through the histogram of lists.
+    // If none exist, bytes is greater than _MAX_ALLOC(=128KB) - return nullptr.
+    // (Therefore, only use this function to search for blocks in the heap)
+    _MallocMetaData* getFreeBlock(size_t bytes)
     {
-        if(!start)
+        if(bytes > _MAX_ALLOC)
         {
             return nullptr;
         }
-        if(start->is_free && start->size >= bytes)
+
+         // This will be the beginning index to search at. 
+         // No point in searching in any other list before, because it will definitely be of smaller sizes.
+        int index = SIZE_TO_INDEX(bytes);
+        _MallocMetaData* curr = nullptr;
+
+        for(int i = index; i < _HIST_SIZE; i++)
         {
-            return start;
-        }
-        while(start->next)
-        {
-            start = start->next;
-            if(start->is_free && start->size >= bytes)
+            if(hist[i].size <= 0)
             {
-                return start;
+                continue;
+            }
+            curr = hist[i].head; // head is not nullptr because size > 0.
+            while(curr)
+            {
+                // Check if this curr is able to contain the required bytes. 
+                // (It is definitely free because hist contains only free blocks)
+                if(curr->is_free && bytes <= curr->size)
+                {
+                    return curr;
+                }
+
+                curr = curr->next_hist;
             }
         }
+
+        // We have searched all the relevant lists of free blocks, and found no matching block.
         return nullptr;
     }
 
@@ -133,6 +150,8 @@ private:
         int size = to_insert->size;
         int index = SIZE_TO_INDEX(size);
         assert(index < _HIST_SIZE);
+
+        hist[index].size++; // Someone will definitely get in this list one way or another.
 
         if (hist[index].head == nullptr) // The list is empty at the corresponding index for size
         {
@@ -182,6 +201,8 @@ private:
         int size = to_remove->size;
         int index = SIZE_TO_INDEX(size);
         assert(index < _HIST_SIZE);
+
+        hist[index].size--; // Remove will always be successful.
 
         if(to_remove == hist[index].head && to_remove == hist[index].tail)
         {
@@ -271,7 +292,7 @@ private:
         if (block->size - in_use >= _MIN_SPLIT + _METADATA_SIZE) 
         {
             block->size = in_use;
-            void* split_point = reinterpret_cast<void*>(reinterpret_cast<char*>(block) + in_use); //FIXME i hate pointer arithmentics
+            void* split_point = reinterpret_cast<void*>(reinterpret_cast<char*>(block) + in_use);
             setMetaData(reinterpret_cast<_MallocMetaData*>(split_point), block->size-in_use, true, block->next, block);
             block->next = reinterpret_cast<_MallocMetaData*>(split_point);
 
@@ -305,16 +326,16 @@ private:
                 {
                     if(block->next->is_free)
                     {
-                        if(new_block) _mergeFreeToSurrounding(block, new_block);
+                        if(new_block) _mergeToSurrounding(block, new_block, true);
                         return true;
                     }
                     else
                     {
-                        if(new_block) _mergeFreeToPrev(block, new_block);
+                        if(new_block) _mergeToPrev(block, new_block, true);
                         return true;
                     }
                 }
-                if(new_block) _mergeFreeToPrev(block, new_block);
+                if(new_block) _mergeToPrev(block, new_block, true);
                 return true;
             }
         }
@@ -322,7 +343,7 @@ private:
         {
             if(block->next->is_free)
             {
-                if(new_block) _mergeFreeToNext(block, new_block);
+                if(new_block) _mergeToNext(block, new_block, true);
                 return true;
             }
         }
@@ -332,26 +353,28 @@ private:
     }
 
     /**
-     * Assumption: block, its prev, and its next - all exist and are free.
+     * Assumption: block, its prev, and its next - all exist.
+     * Will not change the data that was in the original input address of block and its surroundings.
      * Merge all of them to one big block and set new_block to the metadata address of the merged block.
      */
-    _MallocMetaData* _mergeFreeToSurrounding(_MallocMetaData* block, _MallocMetaData** new_block)
+    _MallocMetaData* _mergeToSurrounding(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->next); assert(block->prev); assert(new_block);
-        return _mergeFreeToNext(_mergeFreeToPrev(block, new_block), new_block);
+        return _mergeToNext(_mergeToPrev(block, new_block, to_free), new_block, to_free);
     }
 
     /**
-     * Assumption: block and its prev exist and are free.
+     * Assumption: block and its prev exist.
+     * Will not change the data that was in the original input address of block and its surroundings.
      * Merge them to one big block and set new_block to the metadata address of the merged block.
      */
-    _MallocMetaData* _mergeFreeToPrev(_MallocMetaData* block, _MallocMetaData** new_block)
+    _MallocMetaData* _mergeToPrev(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->prev); assert(new_block);
         histRemove(block);
         histRemove(block->prev);
 
-        setMetaData(block->prev, block->prev->size + block->size + _METADATA_SIZE, true, block->next, block->prev->prev);
+        setMetaData(block->prev, block->prev->size + block->size + _METADATA_SIZE, to_free, block->next, block->prev->prev);
         if(block->prev->next) // NOTE: This is the updated next block for the merged block - if it exists:
         {
             block->prev->next->prev = block->prev;
@@ -363,16 +386,17 @@ private:
     }
 
     /**
-     * Assumption: block and its next exist and are free.
+     * Assumption: block and its next exist.
+     * Will not change the data that was in the original input address of block and its surroundings.
      * Merge them to one big block and set new_block to the metadata address of the merged block.
      */
-    _MallocMetaData* _mergeFreeToNext(_MallocMetaData* block, _MallocMetaData** new_block)
+    _MallocMetaData* _mergeToNext(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->next); assert(new_block);
         histRemove(block);
         histRemove(block->next);
 
-        setMetaData(block, block->size + block->next->size + _METADATA_SIZE, true, block->next->next, block->prev);
+        setMetaData(block, block->size + block->next->size + _METADATA_SIZE, to_free, block->next->next, block->prev);
         if(block->next) // NOTE: This is the updated next block - if it exists:
         {
             block->next->prev = block;
