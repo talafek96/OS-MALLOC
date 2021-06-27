@@ -35,3 +35,4 @@ build/
 Source/test2
 Source/tests_malloc_2.cpp
 CMakeLists.txt
+.vscode/settings.json
