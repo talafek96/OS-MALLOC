@@ -238,7 +238,7 @@ public:
         free_block->is_free = false;
         num_free_blocks--;
         num_free_bytes -= free_block->size;
-        memcpy(getPayload(free_block), oldp, oldmeta->size - _METADATA_SIZE);
+        memcpy(getPayload(free_block), oldp, oldmeta->size);
 
         sfree(oldp);
         return getPayload(free_block);
