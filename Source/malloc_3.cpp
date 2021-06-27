@@ -313,7 +313,7 @@ private:
      * Return true if was able to merge and update new_block to point to the new metadata.
      * Otherwise, return false.
      * If new_block is null, only return true if the merge is possible in any way or false otherwise.
-     */ 
+     */
     bool mergeFree(_MallocMetaData* block, _MallocMetaData** new_block)
     {
         if(!block || !block->is_free)
@@ -328,16 +328,34 @@ private:
                 {
                     if(block->next->is_free)
                     {
-                        if(new_block) _mergeToSurrounding(block, new_block, true);
+                        if(new_block) 
+                        {
+                            num_meta_data_bytes -= (2*_METADATA_SIZE);
+                            num_free_blocks -= 2;
+                            num_free_bytes += (2 * _METADATA_SIZE);
+                            _mergeToSurrounding(block, new_block, true);
+                        }
                         return true;
                     }
                     else
                     {
-                        if(new_block) _mergeToPrev(block, new_block, true);
+                        if(new_block) 
+                        {
+                            num_meta_data_bytes -= _METADATA_SIZE;
+                            num_free_blocks--;
+                            num_free_bytes += _METADATA_SIZE;
+                            _mergeToPrev(block, new_block, true);
+                        }
                         return true;
                     }
                 }
-                if(new_block) _mergeToPrev(block, new_block, true);
+                if(new_block)
+                {
+                    num_meta_data_bytes -= _METADATA_SIZE;
+                    num_free_blocks--;
+                    num_free_bytes += _METADATA_SIZE;
+                    _mergeToPrev(block, new_block, true);
+                }
                 return true;
             }
         }
@@ -345,7 +363,13 @@ private:
         {
             if(block->next->is_free)
             {
-                if(new_block) _mergeToNext(block, new_block, true);
+                if(new_block) 
+                {
+                    num_meta_data_bytes -= _METADATA_SIZE;
+                    num_free_blocks--;
+                    num_free_bytes += _METADATA_SIZE;
+                    _mergeToNext(block, new_block, true);
+                }
                 return true;
             }
         }
@@ -558,13 +582,27 @@ public:
     void sfree(void* p)
     {
         _MallocMetaData* ptr = getMetaData(p);
-        if(p == nullptr || ptr->is_free == true)
+        if(ptr == nullptr || ptr->is_free == true)
         {
             return;
         }
         ptr->is_free = true;
+
+        // Update statistics (merge will update again if there are adjecent blocks that are also free)
         num_free_blocks++;
         num_free_bytes += ptr->size;
+        num_allocated_blocks--;
+        num_allocated_bytes -= ptr->size;
+        
+        _MallocMetaData* new_block;
+        bool res = mergeFree(ptr, &new_block); // Merge updates the statistics assuming that block is free.
+        if (res)
+        {
+            histInsert(new_block);
+            return;
+        }
+        histInsert(ptr);
+        return;
     }
 
     void* srealloc(void* oldp, size_t size)
