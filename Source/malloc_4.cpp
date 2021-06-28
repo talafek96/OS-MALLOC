@@ -17,7 +17,7 @@
 struct _MallocMetaData
 {
     size_t size;
-    bool is_free;
+    size_t is_free;
     _MallocMetaData* next;
     _MallocMetaData* prev;
     _MallocMetaData* next_hist;
@@ -517,7 +517,7 @@ public:
         }
 
         size = _roundUp(size);
-
+        
         if(!IS_MMAPPED(size))
         {
             if(head == nullptr) // This is the first allocation made so far
