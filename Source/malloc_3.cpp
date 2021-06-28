@@ -70,7 +70,7 @@ private:
 
     inline _MallocMetaData* getMetaData(void* p)
     {
-        return reinterpret_cast<_MallocMetaData*>(reinterpret_cast<char*>(p) - _METADATA_SIZE);
+        return p == nullptr? nullptr : reinterpret_cast<_MallocMetaData*>(reinterpret_cast<char*>(p) - _METADATA_SIZE);
     }
 
     // Set the metadata members. 
@@ -293,8 +293,14 @@ private:
         // Check if the leftover size is big enough for a new block of at least _MIN_SPLIT bytes + metadata size bytes:
         if (block->size - in_use >= _MIN_SPLIT + _METADATA_SIZE) 
         {
-            void* split_point = reinterpret_cast<void*>(reinterpret_cast<char*>(block) + in_use);
-            setMetaData(reinterpret_cast<_MallocMetaData*>(split_point), block->size-in_use, true, block->next, block);
+            void* split_point = reinterpret_cast<void*>(reinterpret_cast<char*>(block) + in_use + _METADATA_SIZE);
+            setMetaData(reinterpret_cast<_MallocMetaData*>(split_point), block->size-in_use-_METADATA_SIZE, true, block->next, block);
+            
+            if(reinterpret_cast<_MallocMetaData*>(split_point)->next)
+            {
+                reinterpret_cast<_MallocMetaData*>(split_point)->next->prev = reinterpret_cast<_MallocMetaData*>(split_point);
+            }
+
             block->size = in_use;
             block->next = reinterpret_cast<_MallocMetaData*>(split_point);
 
@@ -330,10 +336,14 @@ private:
                     {
                         if(new_block) 
                         {
-                            num_meta_data_bytes -= (2*_METADATA_SIZE);
+                            num_meta_data_bytes -= (2 * _METADATA_SIZE);
+                            num_allocated_bytes += (2 * _METADATA_SIZE);
                             num_free_blocks -= 2;
                             num_free_bytes += (2 * _METADATA_SIZE);
                             num_allocated_blocks -= 2;
+                            histRemove(block);
+                            histRemove(block->prev);
+                            histRemove(block->next);
                             _mergeToSurrounding(block, new_block, true);
                         }
                         return true;
@@ -345,7 +355,10 @@ private:
                             num_meta_data_bytes -= _METADATA_SIZE;
                             num_free_blocks--;
                             num_free_bytes += _METADATA_SIZE;
+                            num_allocated_bytes += _METADATA_SIZE;
                             num_allocated_blocks--;
+                            histRemove(block);
+                            histRemove(block->prev);
                             _mergeToPrev(block, new_block, true);
                         }
                         return true;
@@ -354,24 +367,30 @@ private:
                 if(new_block)
                 {
                     num_meta_data_bytes -= _METADATA_SIZE;
+                    num_allocated_bytes += _METADATA_SIZE;
                     num_free_blocks--;
                     num_free_bytes += _METADATA_SIZE;
                     num_allocated_blocks--;
+                    histRemove(block);
+                    histRemove(block->prev);
                     _mergeToPrev(block, new_block, true);
                 }
                 return true;
             }
         }
-        else if(block->next)
+        if(block->next)
         {
             if(block->next->is_free)
             {
                 if(new_block) 
                 {
                     num_meta_data_bytes -= _METADATA_SIZE;
+                    num_allocated_bytes += _METADATA_SIZE;
                     num_free_blocks--;
                     num_free_bytes += _METADATA_SIZE;
                     num_allocated_blocks--;
+                    histRemove(block);
+                    histRemove(block->next);
                     _mergeToNext(block, new_block, true);
                 }
                 return true;
@@ -390,7 +409,7 @@ private:
     _MallocMetaData* _mergeToSurrounding(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->next); assert(block->prev); assert(new_block);
-        return _mergeToNext(_mergeToPrev(block, new_block, to_free), new_block, to_free);
+        return _mergeToNext(_mergeToPrev(block, new_block, false), new_block, to_free);
     }
 
     /**
@@ -401,8 +420,6 @@ private:
     _MallocMetaData* _mergeToPrev(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->prev); assert(new_block);
-        histRemove(block);
-        histRemove(block->prev);
 
         setMetaData(block->prev, block->prev->size + block->size + _METADATA_SIZE, to_free, block->next, block->prev->prev);
         if(block->prev->next) // NOTE: This is the updated next block for the merged block - if it exists:
@@ -410,7 +427,7 @@ private:
             block->prev->next->prev = block->prev;
         }
 
-        histInsert(block->prev);
+        if(to_free) histInsert(block->prev);
         *new_block = block->prev;
         return block->prev;
     }
@@ -423,16 +440,14 @@ private:
     _MallocMetaData* _mergeToNext(_MallocMetaData* block, _MallocMetaData** new_block, bool to_free)
     {
         assert(block); assert(block->next); assert(new_block);
-        histRemove(block);
-        histRemove(block->next);
-
+        
         setMetaData(block, block->size + block->next->size + _METADATA_SIZE, to_free, block->next->next, block->prev);
         if(block->next) // NOTE: This is the updated next block - if it exists:
         {
             block->next->prev = block;
         }
 
-        histInsert(block);
+        if(to_free) histInsert(block);
         *new_block = block;
         return block;
     }
@@ -564,6 +579,7 @@ public:
 
             // If there exists a free block that can contain size bytes:
             free_block->is_free = false;
+            histRemove(free_block);
             _MallocMetaData* res = split(free_block, size);
 
             // Update statistics:
@@ -579,12 +595,12 @@ public:
                 num_free_bytes -= (size + _METADATA_SIZE);
                 num_allocated_bytes -= _METADATA_SIZE;
                 num_meta_data_bytes += _METADATA_SIZE;
+                num_allocated_blocks++;
             }
-            
             return getPayload(free_block);
         }
         else
-        {   // TODO: Check why exactly use these flags.
+        {
             void* ptr = mmap(NULL, size + _METADATA_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if(ptr == MAP_FAILED)
             {
@@ -628,13 +644,8 @@ public:
             num_free_bytes += ptr->size;
 
             _MallocMetaData* new_block;
-            bool res = mergeFree(ptr, &new_block); // Merge updates the statistics assuming that block is free.
-            if (res)
-            {
-                histInsert(new_block);
-                return;
-            }
             histInsert(ptr);
+            bool res = mergeFree(ptr, &new_block); // Merge updates the statistics assuming that block is free.
             return;
         }
         else
@@ -645,6 +656,7 @@ public:
             num_meta_data_bytes -= _METADATA_SIZE;
 
             // Unmap region:
+            mmapRemove(ptr);
             munmap(p, ptr->size + _METADATA_SIZE);
         }
     }
@@ -663,171 +675,192 @@ public:
         _MallocMetaData* oldmeta = reinterpret_cast<_MallocMetaData*>(getMetaData(oldp));
         size_t old_size = oldmeta->size;
 
-        // A: Try to reuse the current block without any merging:
-        if(size <= oldmeta->size)
+        if(!IS_MMAPPED(old_size))
         {
-            size_t old_size = oldmeta->size;
-            _MallocMetaData* new_block = split(oldmeta, size);
-            if(new_block)
+            // A: Try to reuse the current block without any merging:
+            if(size <= oldmeta->size)
             {
-                // If the split succeeded, update statistics:
-                num_free_bytes += (old_size - size - _METADATA_SIZE);
-                num_meta_data_bytes += _METADATA_SIZE;
+                _MallocMetaData* new_block = split(oldmeta, size);
+                if(new_block)
+                {
+                    // If the split succeeded, update statistics:
+                    num_free_bytes += new_block->size;
+                    num_meta_data_bytes += _METADATA_SIZE;
+                    num_allocated_bytes -= _METADATA_SIZE;
+                    num_free_blocks++;
+                    num_allocated_blocks++;
+                }
+                return oldp;
             }
-            return oldp;
-        }
 
-        // B: Try to merge with the adjacent block with the LOWER address:
-        else if(oldmeta->prev && oldmeta->prev->is_free && (oldmeta->size + oldmeta->prev->size + _METADATA_SIZE >= size))
-        {
-            // We can merge the left block with our block.
-            _MallocMetaData* new_block = nullptr;
-
-            // Update statistics:
-            num_meta_data_bytes -= _METADATA_SIZE;
-            num_allocated_bytes += _METADATA_SIZE;
-            num_free_bytes -= oldmeta->prev->size;
-            num_free_blocks--;
-            num_allocated_blocks--;
-            
-            _mergeToPrev(oldmeta, &new_block, false);
-
-            _MallocMetaData* splitted = split(new_block, size);
-            if(splitted)
+            // B: Try to merge with the adjacent block with the LOWER address:
+            else if(oldmeta->prev && oldmeta->prev->is_free && (oldmeta->size + oldmeta->prev->size + _METADATA_SIZE >= size))
             {
+                // We can merge the left block with our block.
+                _MallocMetaData* new_block = nullptr;
+
                 // Update statistics:
-                num_free_blocks++;
-                num_free_bytes += splitted->size;
-                num_allocated_blocks++;
-                num_meta_data_bytes += _METADATA_SIZE;
-                num_allocated_bytes -= _METADATA_SIZE;
+                num_meta_data_bytes -= _METADATA_SIZE;
+                num_allocated_bytes += _METADATA_SIZE;
+                num_free_bytes -= oldmeta->prev->size;
+                num_free_blocks--;
+                num_allocated_blocks--;
+                
+                histRemove(oldmeta->prev);
+                _mergeToPrev(oldmeta, &new_block, false);
+
+                // Copy the data to the new address:
+                memmove(getPayload(new_block), oldp, old_size);
+
+                _MallocMetaData* splitted = split(new_block, size);
+                if(splitted)
+                {
+                    // Update statistics:
+                    num_free_blocks++;
+                    num_free_bytes += splitted->size;
+                    num_allocated_blocks++;
+                    num_meta_data_bytes += _METADATA_SIZE;
+                    num_allocated_bytes -= _METADATA_SIZE;
+                }
+                return getPayload(new_block);
             }
-            // Copy the data to the new address:
-            memmove(getPayload(new_block), oldp, old_size);
-            return getPayload(new_block);
-        }
 
-        // C: Try to merge with the adjacent block wit hthe HIGHEr address:
-        else if(oldmeta->next && oldmeta->next->is_free && (oldmeta->size + oldmeta->next->size + _METADATA_SIZE >= size))
-        {
-            // We can merge the right block with our block.
-            _MallocMetaData* new_block = nullptr;
-
-            // Update statistics:
-            num_meta_data_bytes -= _METADATA_SIZE;
-            num_allocated_bytes += _METADATA_SIZE;
-            num_free_bytes -= oldmeta->next->size;
-            num_free_blocks--;
-            num_allocated_blocks--;
-            
-            _mergeToNext(oldmeta, &new_block, false);
-
-            _MallocMetaData* splitted = split(new_block, size);
-            if(splitted)
+            // C: Try to merge with the adjacent block wit hthe HIGHER address:
+            else if(oldmeta->next && oldmeta->next->is_free && (oldmeta->size + oldmeta->next->size + _METADATA_SIZE >= size))
             {
+                // We can merge the right block with our block.
+                _MallocMetaData* new_block = nullptr;
+
                 // Update statistics:
-                num_free_blocks++;
-                num_free_bytes += splitted->size;
-                num_allocated_blocks++;
-                num_meta_data_bytes += _METADATA_SIZE;
-                num_allocated_bytes -= _METADATA_SIZE;
+                num_meta_data_bytes -= _METADATA_SIZE;
+                num_allocated_bytes += _METADATA_SIZE;
+                num_free_bytes -= oldmeta->next->size;
+                num_free_blocks--;
+                num_allocated_blocks--;
+                
+                histRemove(oldmeta->next);
+                _mergeToNext(oldmeta, &new_block, false);
+
+                _MallocMetaData* splitted = split(new_block, size);
+                if(splitted)
+                {
+                    // Update statistics:
+                    num_free_blocks++;
+                    num_free_bytes += splitted->size;
+                    num_allocated_blocks++;
+                    num_meta_data_bytes += _METADATA_SIZE;
+                    num_allocated_bytes -= _METADATA_SIZE;
+                }
+                return getPayload(new_block);
             }
-            return getPayload(new_block);
-        }
 
-        // D: Try to merge all those THREE adjacent blocks together:
-        else if(oldmeta->prev && oldmeta->next && \
-        oldmeta->prev->is_free && oldmeta->next->is_free && \
-        (oldmeta->size + oldmeta->prev->size + oldmeta->next->size + 2 * _METADATA_SIZE >= size))
-        {
-            // We can merge the left block with our block.
-            _MallocMetaData* new_block = nullptr;
-
-            // Update statistics:
-            num_meta_data_bytes -= 2 * _METADATA_SIZE;
-            num_allocated_bytes += 2 * _METADATA_SIZE;
-            num_free_bytes -= (oldmeta->prev->size + oldmeta->next->size);
-            num_free_blocks -= 2;
-            num_allocated_blocks -= 2;
-            
-            _mergeToSurrounding(oldmeta, &new_block, false);
-
-            _MallocMetaData* splitted = split(new_block, size);
-            if(splitted)
+            // D: Try to merge all those THREE adjacent blocks together:
+            else if(oldmeta->prev && oldmeta->next && \
+            oldmeta->prev->is_free && oldmeta->next->is_free && \
+            (oldmeta->size + oldmeta->prev->size + oldmeta->next->size + 2 * _METADATA_SIZE >= size))
             {
+                // We can merge the left block with our block.
+                _MallocMetaData* new_block = nullptr;
+
                 // Update statistics:
-                num_free_blocks++;
-                num_free_bytes += splitted->size;
-                num_allocated_blocks++;
-                num_meta_data_bytes += _METADATA_SIZE;
-                num_allocated_bytes -= _METADATA_SIZE;
-            }
-            // Copy the data to the new address:
-            memmove(getPayload(new_block), oldp, old_size);
-            return getPayload(new_block);
-        }
+                num_meta_data_bytes -= 2 * _METADATA_SIZE;
+                num_allocated_bytes += 2 * _METADATA_SIZE;
+                num_free_bytes -= (oldmeta->prev->size + oldmeta->next->size);
+                num_free_blocks -= 2;
+                num_allocated_blocks -= 2;
+                
+                _mergeToSurrounding(oldmeta, &new_block, false);
 
-        // E: Try to find a different block thats large enough to contain the request and is free:
-        _MallocMetaData* free_block = getFreeBlock(size);
-        if(free_block == nullptr) // F: Couldn't find a free block with enough space
-        {
-            // Try to extend the wilderness if possible:
-            if(oldmeta == wilderness)
-            {
-                return _extendWilderness(size);
+                _MallocMetaData* splitted = split(new_block, size);
+                if(splitted)
+                {
+                    // Update statistics:
+                    num_free_blocks++;
+                    num_free_bytes += splitted->size;
+                    num_allocated_blocks++;
+                    num_meta_data_bytes += _METADATA_SIZE;
+                    num_allocated_bytes -= _METADATA_SIZE;
+                }
+                // Copy the data to the new address:
+                memmove(getPayload(new_block), oldp, old_size);
+                return getPayload(new_block);
             }
-            if(wilderness->is_free)
+
+            // E: Try to find a different block thats large enough to contain the request and is free:
+            _MallocMetaData* free_block = getFreeBlock(size);
+            if(free_block == nullptr) // F: Couldn't find a free block with enough space
             {
-                if(!_extendWilderness(size))
+                // Try to extend the wilderness if possible:
+                if(oldmeta == wilderness)
+                {
+                    return _extendWilderness(size);
+                }
+                if(wilderness->is_free)
+                {
+                    if(!_extendWilderness(size))
+                    {
+                        return NULL;
+                    }
+                    memmove(getPayload(wilderness), getPayload(oldmeta),oldmeta->size);
+                    sfree(oldp);
+                    return getPayload(wilderness);
+                }
+
+                // We couldn't extend the wilderness, so allocate a new block:
+                void* prev_brk = sbrk(size + _METADATA_SIZE); // Allocate space at the top of the heap
+                if(prev_brk == (void*)-1)
                 {
                     return NULL;
                 }
-                memmove(getPayload(wilderness), getPayload(oldmeta),oldmeta->size);
-                sfree(oldp);
-                return getPayload(wilderness);
+                _MallocMetaData* old_wilderness = wilderness;
+                old_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
+                wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
+
+                setMetaData(wilderness, size, false, nullptr, old_wilderness);
+                num_allocated_blocks++;
+                num_allocated_bytes += size;
+                num_meta_data_bytes += _METADATA_SIZE;
+
+                // Copy the old payload:
+                memmove(getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk)), oldp, oldmeta->size);
+                
+                sfree(oldp); // This will free and update the stats.
+                return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
             }
-
-            // We couldn't extend the wilderness, so allocate a new block:
-            void* prev_brk = sbrk(size + _METADATA_SIZE); // Allocate space at the top of the heap
-            if(prev_brk == (void*)-1)
-            {
-                return NULL;
-            }
-            _MallocMetaData* old_wilderness = wilderness;
-            old_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
-            wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
-
-            setMetaData(wilderness, size, false, nullptr, old_wilderness);
-            num_allocated_blocks++;
-            num_allocated_bytes += size;
-            num_meta_data_bytes += _METADATA_SIZE;
-
-            // Copy the old payload:
-            memcpy(getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk)), oldp, oldmeta->size);
             
-            sfree(oldp); // This will free and update the stats.
-            return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
-        }
-        
-        // We found a free block with enough space:
-        free_block->is_free = false;
-        num_free_blocks--;
-        num_free_bytes -= free_block->size;
-        // Copy the memory to the new block:
-        memmove(getPayload(free_block), oldp, oldmeta->size);
-        sfree(oldp);
+            // We found a free block with enough space:
+            free_block->is_free = false;
+            histRemove(free_block);
+            num_free_blocks--;
+            num_free_bytes -= free_block->size;
 
-        _MallocMetaData* splitted = split(free_block, oldmeta->size);
-        if(splitted)
-        {
-            // Update statistics because of a successful split:
-            num_free_blocks++;
-            num_free_bytes += splitted->size;
-            num_allocated_blocks++;
-            num_meta_data_bytes += _METADATA_SIZE;
-            num_allocated_bytes -= _METADATA_SIZE;
+            // Copy the memory to the new block:
+            memmove(getPayload(free_block), oldp, oldmeta->size);
+            sfree(oldp);
+
+            _MallocMetaData* splitted = split(free_block, size);
+            if(splitted)
+            {
+                // Update statistics because of a successful split: (Should never be successful)
+                num_free_blocks++;
+                num_free_bytes += splitted->size;
+                num_allocated_blocks++;
+                num_meta_data_bytes += _METADATA_SIZE;
+                num_allocated_bytes -= _METADATA_SIZE;
+            }
+            return getPayload(free_block);
         }
-        return getPayload(free_block);
+        else
+        {
+            if(size == old_size)
+            {
+                return oldp;
+            }
+            void* newp = smalloc(size);
+            memmove(newp, oldp, old_size > size? size : old_size);
+            sfree(oldp);
+            return newp;
+        }
     }
     // $$$$$$$$$$ Main Funcs $$$$$$$$$$ //
 
