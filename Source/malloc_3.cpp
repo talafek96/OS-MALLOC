@@ -10,7 +10,7 @@
 #define _MIN_SPLIT _HIST_SIZE
 
 #define MAX_ALLOC_SIZE 100000000
-#define SIZE_TO_INDEX(size) (size/_LIST_RANGE)
+#define SIZE_TO_INDEX(size) (size == (_MAX_ALLOC + 1)? (_HIST_SIZE - 1) : size/_LIST_RANGE)
 #define IS_MMAPPED(size) (size > _MAX_ALLOC)
 
 // The metadata struct of each allocated block
@@ -786,69 +786,22 @@ public:
                 return getPayload(new_block);
             }
 
-            // E: Try to find a different block thats large enough to contain the request and is free:
-            _MallocMetaData* free_block = getFreeBlock(size);
-            if(free_block == nullptr) // F: Couldn't find a free block with enough space
+            // A-D Failed, so check if we are trying to realloc wilderness, and extend it if so.
+            if(oldmeta == wilderness)
             {
-                // Try to extend the wilderness if possible:
-                if(oldmeta == wilderness)
-                {
-                    return _extendWilderness(size);
-                }
-                if(wilderness->is_free)
-                {
-                    if(!_extendWilderness(size))
-                    {
-                        return NULL;
-                    }
-                    memmove(getPayload(wilderness), getPayload(oldmeta),oldmeta->size);
-                    sfree(oldp);
-                    return getPayload(wilderness);
-                }
-
-                // We couldn't extend the wilderness, so allocate a new block:
-                void* prev_brk = sbrk(size + _METADATA_SIZE); // Allocate space at the top of the heap
-                if(prev_brk == (void*)-1)
-                {
-                    return NULL;
-                }
-                _MallocMetaData* old_wilderness = wilderness;
-                old_wilderness->next = reinterpret_cast<_MallocMetaData*>(prev_brk); // Update the tail's list pointers
-                wilderness = reinterpret_cast<_MallocMetaData*>(prev_brk);
-
-                setMetaData(wilderness, size, false, nullptr, old_wilderness);
-                num_allocated_blocks++;
-                num_allocated_bytes += size;
-                num_meta_data_bytes += _METADATA_SIZE;
-
-                // Copy the old payload:
-                memmove(getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk)), oldp, oldmeta->size);
-                
-                sfree(oldp); // This will free and update the stats.
-                return getPayload(reinterpret_cast<_MallocMetaData*>(prev_brk));
+                return _extendWilderness(size);
             }
-            
-            // We found a free block with enough space:
-            free_block->is_free = false;
-            histRemove(free_block);
-            num_free_blocks--;
-            num_free_bytes -= free_block->size;
 
-            // Copy the memory to the new block:
-            memmove(getPayload(free_block), oldp, oldmeta->size);
+            // Otherwise, call smalloc:
+            void* ptr = smalloc(size);
+            if(!ptr)
+            {
+                return nullptr;
+            }
+
+            memmove(ptr, oldp, size >= oldmeta->size? oldmeta->size : size);
             sfree(oldp);
-
-            _MallocMetaData* splitted = split(free_block, size);
-            if(splitted)
-            {
-                // Update statistics because of a successful split: (Should never be successful)
-                num_free_blocks++;
-                num_free_bytes += splitted->size;
-                num_allocated_blocks++;
-                num_meta_data_bytes += _METADATA_SIZE;
-                num_allocated_bytes -= _METADATA_SIZE;
-            }
-            return getPayload(free_block);
+            return ptr;
         }
         else
         {
