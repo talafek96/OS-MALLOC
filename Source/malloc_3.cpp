@@ -287,6 +287,7 @@ private:
      * Check if the block uses a lot less data than the total payload size and:
      * If it is, split it, add the new free block to the hist, and return the address of the splitted FREE metadata struct.
      * Otherwise return NULL.
+     * - If split was successful and block was the wilderness, update the wilderness to be the splitted new block.
      */ 
     _MallocMetaData* split(_MallocMetaData* block, size_t in_use)
     {
@@ -306,6 +307,7 @@ private:
 
             // Insert the new freed block to the hist:
             histInsert(reinterpret_cast<_MallocMetaData*>(split_point));
+            if(block == wilderness) wilderness = reinterpret_cast<_MallocMetaData*>(split_point);
             return reinterpret_cast<_MallocMetaData*>(split_point);
         }
 
@@ -421,6 +423,10 @@ private:
     {
         assert(block); assert(block->prev); assert(new_block);
 
+        if(block == wilderness)
+        {
+            wilderness = block->prev;
+        }
         setMetaData(block->prev, block->prev->size + block->size + _METADATA_SIZE, to_free, block->next, block->prev->prev);
         if(block->prev->next) // NOTE: This is the updated next block for the merged block - if it exists:
         {
@@ -441,6 +447,7 @@ private:
     {
         assert(block); assert(block->next); assert(new_block);
         
+        if(block->next == wilderness) wilderness = block;
         setMetaData(block, block->size + block->next->size + _METADATA_SIZE, to_free, block->next->next, block->prev);
         if(block->next) // NOTE: This is the updated next block - if it exists:
         {
@@ -479,7 +486,6 @@ private:
                 // Update statistics:
                 num_free_bytes -= (wilderness->size + _METADATA_SIZE);
                 num_meta_data_bytes += _METADATA_SIZE;
-                wilderness = res; // The free splitted block is the new wilderness block.
                 return wilderness;
             }
 
@@ -789,7 +795,7 @@ public:
             // A-D Failed, so check if we are trying to realloc wilderness, and extend it if so.
             if(oldmeta == wilderness)
             {
-                return _extendWilderness(size);
+                return getPayload(_extendWilderness(size));
             }
 
             // Otherwise, call smalloc:
